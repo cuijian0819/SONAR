@@ -15,6 +15,7 @@ cd glove && make && cd ..
 
 2. run 
 ```
+mkdir data/
 python sonar.py 
 ```
 
