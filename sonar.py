@@ -24,6 +24,18 @@ from nltk.stem import WordNetLemmatizer
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english"))
 
+import torch
+from torch.utils.data import TensorDataset, DataLoader, \
+RandomSampler, SequentialSampler
+
+from transformers import AutoTokenizer
+
+import sys
+sys.path.append('../')
+
+from model.tweetclassifier import TweetClassifier
+from utils.preprocess_text import preprocess_text
+from utils.classification_utils import evaluate
 import logging
 
 from pdb import set_trace 
@@ -39,7 +51,7 @@ def is_dict_of_lists_empty(d):
 
 def keyword_finder(
     glove_model, category_keywords,
-    alpha=0.2, beta=0.1,
+    alpha=0.2, beta=0.3,
     ):
 
     categories = list(category_keywords.keys()) 
@@ -52,7 +64,7 @@ def keyword_finder(
         for seed_keyword in seed_keywords:
             if seed_keyword not in glove_model:
                 continue
-            similar_words = glove_model.most_similar(seed_keyword, topn=10000)  
+            similar_words = glove_model.most_similar(seed_keyword, topn=100)  
             neighbors = [word for word, similarity in similar_words if similarity > alpha]
             
             # Create a list of neighbors that meet the threshold α
@@ -110,8 +122,60 @@ def flatten_dict_values(input_dict):
         flat_list.extend(value)
     return flat_list
 
+def tag_category(filtered_tweets, device):
 
+    lm = 'bertweet'
+    rs = 1234
+
+    print(f"classfier is on {device}")
+    model_path = f'../trained_models/tweet_multi_cls_{lm}_{rs}.pt'
+
+    model = TweetClassifier(lm)
+    model.load_state_dict(torch.load(model_path,  map_location=device), strict=False)
+    model.to(device)
+
+    print('load bertweet tokenizer')
+    tokenizer = AutoTokenizer.from_pretrained('vinai/bertweet-base')
+    
+    X = filtered_tweets
+    y = torch.tensor(([[0]*7 for _ in range(len(filtered_tweets))])) # dummy y 
+
+    inputs = tokenizer(
+        X, return_tensors="pt",
+        padding=True, truncation=True)
+    test_data = TensorDataset(
+        y,
+        inputs['input_ids'],
+        inputs['attention_mask'],
+        y,
+    )
+    test_sampler = SequentialSampler(test_data)
+
+    test_dataloader = DataLoader(
+        test_data,
+        sampler=test_sampler,
+        batch_size=4096)
+
+    loss_fn = torch.nn.CrossEntropyLoss(weight=torch.tensor([0.2, 0.8]).to(device))         
+
+    print("Computing event type...")
+    logits_list, labels_list, input_idx_list, val_loss = evaluate(model, test_dataloader, loss_fn, device)
+
+    logits_list = [logits.cpu() for logits in logits_list]
+    labels_list = [labels.cpu() for labels in labels_list]
+    preds_list = [torch.argmax(logits, dim=1).flatten() for logits in logits_list]
+    preds_list = [preds.unsqueeze(dim=1) for preds in preds_list]
+    preds_matrix = torch.cat(preds_list, dim=1)
+
+    et_list = preds_matrix.tolist()
+
+    return et_list
+    
+    
 if __name__ == "__main__":
+
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+
     # Load data
     tweet_df = pd.read_excel('dummy_tweets.xlsx')
     # tweet_df = tweet_df.drop_duplicates(subset=['text'])
@@ -123,7 +187,7 @@ if __name__ == "__main__":
 
     # Initialize the current date
     current_date = start_date
-    concatenated_documents = []
+    concatenated_documents, uid_list, et_list = [], [], [] 
     start_list, end_list = [], []
     # Iterate through the dates in November
     while current_date <= end_date:
@@ -144,22 +208,25 @@ if __name__ == "__main__":
         with open("data/tokenized_tweets.txt", "w", encoding="utf-8") as file:
             for tweet in tokenized_tweets:
                 file.write(tweet + "\n")
+
         # Train GloVe model
         subprocess.call(['sh', './train_glove.sh'],stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # Load the GloVe model
         glove_model = load_glove_model()
+
         # print(category_keywords)
         keyword_finder(glove_model, category_keywords)
         if is_dict_of_lists_empty(category_keywords): 
-            current_date += 1
+            current_date += timedelta(days=1)
             continue
             
         # Filter tweets with updated keywords
         all_keywords = flatten_dict_values(category_keywords)
-        # print(all_keywords)
+
         filtered_tweets = [doc for doc in security_tweets if any(keyword in doc.lower() for keyword in all_keywords)]
         print(f"# Tweets: {len(security_tweets)}, after keyword filtering: {len(filtered_tweets)}")
+        all_et_list = tag_category(filtered_tweets, device)
 
         if len(filtered_tweets)==0: continue;
 
@@ -172,9 +239,9 @@ if __name__ == "__main__":
 
         # Create a NearPy LSH engine
         dimension = len(tfidf_vectorizer.get_feature_names_out())
-        num_projections = 13  # Number of hyperplanes
-        num_tables = 70  # Number of hash tables
-        max_sim = 0.5  # Maximum distance for similarity
+        num_projections = 2  # Number of hyperplanes
+        num_tables = 10  # Number of hash tables
+        threshold = 0.2
         engine = Engine(
             dimension, 
             lshashes=[RandomBinaryProjections('rbp', num_projections)], 
@@ -182,7 +249,6 @@ if __name__ == "__main__":
             )
 
         # Initialize variables
-        threshold = 0.5
         inverted_index = defaultdict(list)
         recent_docs = []  # Store the most recent documents for comparison
         events = []
@@ -191,45 +257,59 @@ if __name__ == "__main__":
         for doc_id, doc in enumerate(filtered_tweets):
             tfidf_vector = tfidf_matrix[doc_id].toarray()[0]  # Extract the TF-IDF vector for the current document
             engine.store_vector(tfidf_vector, doc_id)
+        
+        # Get event
+        doc_checked = set()
+        for doc_id, doc in enumerate(filtered_tweets):
+            if doc_id in doc_checked:
+                continue
+            doc_checked.add(doc_id)
 
             # Query the LSH engine to find similar documents
             neighbors = engine.neighbours(tfidf_matrix[doc_id].toarray()[0])
 
-            # Set an initial minimum distance
-            min_sim = 0
-
+            event = set()
             # Check neighbors for similarity
             for _, neighbor_id, _ in neighbors:
                 if neighbor_id != doc_id:  # Exclude self
                     similarity = cosine_similarity(tfidf_matrix[doc_id], tfidf_matrix[neighbor_id])[0][0]
-                    if similarity > min_sim:
-                        min_sim = similarity
-                        nearest_neighbor_id = neighbor_id
-            
-            # This tweet can be attached to somewhere
-            if min_sim > max_sim:
-                # Look for similar documents in the past 1000 tweets
-                for recent_doc_id in recent_docs[:1000]:
-                    similarity = cosine_similarity(tfidf_matrix[doc_id], tfidf_matrix[recent_doc_id])
-                    if similarity > threshold:
-                        if len(events) == 0: 
-                            events.append({doc_id, recent_doc_id})
-                            continue
-                        # Find the events that the current document and recent document belong to
-                        for event in events:
-                            added = False
-                            if recent_doc_id in event: # added to existing cluster
-                                added = True
-                                event.add(doc_id)
-                        if not added: # new one! 
-                            events.append({doc_id, recent_doc_id})
-            recent_docs.append(doc_id)
+                    if similarity > threshold and neighbor_id not in doc_checked:
+                        doc_checked.add(neighbor_id)
+                        event.add(neighbor_id)
+            if len(event) > 5:
+                events.append(event) 
+                
+            # # This tweet can be attached to somewhere
+            # if min_sim > threshold:
+            #     # Look for similar documents in the past 1000 tweets
+            #     for recent_doc_id in recent_docs[:1000]:
+            #         similarity = cosine_similarity(tfidf_matrix[doc_id], tfidf_matrix[recent_doc_id])
+            #         if similarity > threshold:
+            #             if len(events) == 0: 
+            #                 events.append({doc_id, recent_doc_id})
+            #                 continue
+            #             # Find the events that the current document and recent document belong to
+            #             for event in events:
+            #                 added = False
+            #                 if recent_doc_id in event: # added to existing cluster
+            #                     added = True
+            #                     event.add(doc_id)
+            #             if not added: # new one! 
+            #                 events.append({doc_id, recent_doc_id})
+            # recent_docs.append(doc_id)
 
         # Wrapping up results
+        
         for tweet_set in events:
+            # uid_list.append([tid2uid[tid] for tid in tweet_set])
+            # tid_list.append([tid for tid in tweet_set])
+            et_list.append([all_et_list[tid] for tid in tweet_set])
+            # score.append(len(uid_list)/len(tid_list))
+
             sampled_indices = random.sample(list(tweet_set), min(5, len(tweet_set)))
             sampled_documents = [f"T{i}:{filtered_tweets[idx]}" for i, idx in enumerate(sampled_indices)]
             concatenated_documents.append('\n'.join(sampled_documents))
+
         
         start_list.extend([current_date]*len(events))
         current_date += one_day
@@ -241,6 +321,10 @@ if __name__ == "__main__":
     df = pd.DataFrame({
         'start_date': start_list, 
         'endt_date': end_list, 
+        # 'uid_list': uid_list,
+        # 'tid_list': tid_list,
+        'et_list': et_list,
+        # 'score': score_list,
         'events': concatenated_documents,
         })
     df.to_excel('sonar_events.xlsx', index=False)  # Set index=False to exclude row numbers
